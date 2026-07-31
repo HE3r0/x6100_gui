@@ -34,9 +34,6 @@ static void bt_state_changed_cb(void *s, lv_msg_t *m);
 static void bt_devices_changed_cb(void *s, lv_msg_t *m);
 static void update_status_label(void);
 static void update_devices_table(void);
-static void start_refresh_devices(void);
-static void stop_refresh_devices(void);
-static void update_devices_table_cb(lv_timer_t *timer);
 static void refresh_buttons(void);
 
 static button_data_t btn_on_off = {
@@ -55,13 +52,12 @@ static buttons_page_t btn_page = {
     {&btn_on_off, &btn_scan, NULL, NULL, NULL}
 };
 
-static lv_obj_t   *label_status;
-static lv_obj_t   *label_scan;
-static lv_obj_t   *device_table;
-static lv_timer_t *timer_refresh_devices = NULL;
-static void       *subscription_state = NULL;
-static void       *subscription_devices = NULL;
-static bool        updating_table = false;
+static lv_obj_t *label_status;
+static lv_obj_t *label_scan;
+static lv_obj_t *device_table;
+static void     *subscription_state = NULL;
+static void     *subscription_devices = NULL;
+static bool      updating_table = false;
 
 static dialog_t dialog = {
     .run          = false,
@@ -139,7 +135,6 @@ static void construct_cb(lv_obj_t *parent) {
 }
 
 static void destruct_cb(void) {
-    stop_refresh_devices();
     bluetooth_stop_scan();
 
     if (subscription_state) {
@@ -197,7 +192,6 @@ static void bt_power_toggle_cb(button_data_t *btn_data) {
     }
 
     if (bluetooth_is_powered()) {
-        stop_refresh_devices();
         bluetooth_power_off();
         msg_update_text_fmt("Bluetooth off");
     } else {
@@ -218,13 +212,11 @@ static void start_scan_cb(button_data_t *btn_data) {
     }
 
     if (bluetooth_scanning()) {
-        stop_refresh_devices();
         bluetooth_stop_scan();
-        msg_update_text_fmt("Scan stopped");
+        msg_update_text_fmt("Stopping scan...");
     } else {
         bluetooth_start_scan();
-        start_refresh_devices();
-        msg_update_text_fmt("Scanning...");
+        msg_update_text_fmt("Starting scan...");
     }
 
     update_status_label();
@@ -246,7 +238,7 @@ static const char *bt_scan_label_getter(void) {
     if (!bluetooth_is_powered()) {
         return "Scan";
     }
-    return bluetooth_scanning() ? "Scanning..." : "Scan";
+    return bluetooth_scanning() ? "Stop\nScan" : "Scan";
 }
 
 static void update_status_label(void) {
@@ -362,27 +354,4 @@ static void bt_devices_changed_cb(void *s, lv_msg_t *m) {
     update_status_label();
     update_devices_table();
     refresh_buttons();
-}
-
-static void start_refresh_devices(void) {
-    if (!timer_refresh_devices) {
-        timer_refresh_devices = lv_timer_create(update_devices_table_cb, 1500, NULL);
-    }
-}
-
-static void stop_refresh_devices(void) {
-    if (timer_refresh_devices) {
-        lv_timer_del(timer_refresh_devices);
-        timer_refresh_devices = NULL;
-    }
-}
-
-static void update_devices_table_cb(lv_timer_t *timer) {
-    (void)timer;
-
-    if (!dialog.run || !bluetooth_is_powered() || !bluetooth_scanning()) {
-        return;
-    }
-
-    bluetooth_refresh_devices();
 }
