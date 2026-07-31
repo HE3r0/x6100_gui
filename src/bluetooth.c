@@ -219,9 +219,95 @@ static int compare_devices(const void *a, const void *b) {
 }
 
 static void clear_devices(void) {
+    bool had_devices = device_count > 0;
     device_count = 0;
     selected_index = -1;
-    notify_devices_changed();
+    if (had_devices) {
+        notify_devices_changed();
+    }
+}
+
+static void sanitize_name(char *name, size_t size) {
+    if (!name || size == 0) {
+        return;
+    }
+
+    for (size_t i = 0; name[i] != '\0' && i < size; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c < 0x20 || c == 0x7f) {
+            name[i] = '?';
+        }
+    }
+
+    if (name[0] == '\0') {
+        g_strlcpy(name, "Unknown", size);
+    }
+}
+
+static void parse_device_dict(GVariant *objects) {
+    GVariantIter iter;
+    const char  *path = NULL;
+    GVariant    *ifaces = NULL;
+
+    device_count = 0;
+    g_variant_iter_init(&iter, objects);
+
+    while (device_count < BT_MAX_DEVICES &&
+           g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &ifaces)) {
+        GVariant *props = g_variant_lookup_value(ifaces, DEVICE_INTERFACE, G_VARIANT_TYPE("a{sv}"));
+        g_variant_unref(ifaces);
+        ifaces = NULL;
+
+        if (!props) {
+            continue;
+        }
+
+        bt_device_info_t *dev = &devices[device_count];
+        memset(dev, 0, sizeof(*dev));
+
+        if (path) {
+            g_strlcpy(dev->path, path, sizeof(dev->path));
+        }
+
+        if (!prop_dict_get_string(props, "Alias", dev->name, sizeof(dev->name)) &&
+            !prop_dict_get_string(props, "Name", dev->name, sizeof(dev->name))) {
+            prop_dict_get_string(props, "Address", dev->name, sizeof(dev->name));
+        }
+        sanitize_name(dev->name, sizeof(dev->name));
+
+        prop_dict_get_string(props, "Address", dev->address, sizeof(dev->address));
+        prop_dict_get_bool(props, "Paired", &dev->paired);
+        prop_dict_get_bool(props, "Connected", &dev->connected);
+        prop_dict_get_int16(props, "RSSI", &dev->rssi);
+
+        g_variant_unref(props);
+        device_count++;
+    }
+
+    if (device_count > 1) {
+        qsort(devices, device_count, sizeof(devices[0]), compare_devices);
+    }
+
+    if (selected_index >= (int)device_count) {
+        selected_index = device_count > 0 ? 0 : -1;
+    }
+}
+
+static void parse_managed_objects(GVariant *result) {
+    if (g_variant_is_of_type(result, G_VARIANT_TYPE("a{oa{sa{sv}}}"))) {
+        parse_device_dict(result);
+        return;
+    }
+
+    if (g_variant_is_of_type(result, G_VARIANT_TYPE("(a{oa{sa{sv}}})"))) {
+        GVariant *objects = g_variant_get_child_value(result, 0);
+        parse_device_dict(objects);
+        g_variant_unref(objects);
+        return;
+    }
+
+    LV_LOG_WARN("Bluetooth: unexpected GetManagedObjects type %s",
+                g_variant_get_type_string(result));
 }
 
 static void restore_timer_cb(lv_timer_t *timer) {
@@ -256,54 +342,6 @@ void bluetooth_cancel_restore(void) {
     if (restore_timer) {
         lv_timer_del(restore_timer);
         restore_timer = NULL;
-    }
-}
-
-static void parse_managed_objects(GVariant *result) {
-    GVariantIter *objects_iter = NULL;
-    const char   *path = NULL;
-    GVariant     *interfaces = NULL;
-
-    device_count = 0;
-    g_variant_get(result, "(a{oa{sa{sv}}})", &objects_iter);
-
-    /* Use g_variant_iter_next (not loop): we own the returned interfaces variant. */
-    while (device_count < BT_MAX_DEVICES &&
-           g_variant_iter_next(objects_iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
-        GVariant *props = g_variant_lookup_value(interfaces, DEVICE_INTERFACE, G_VARIANT_TYPE("a{sv}"));
-        g_variant_unref(interfaces);
-        interfaces = NULL;
-
-        if (!props) {
-            continue;
-        }
-
-        bt_device_info_t *dev = &devices[device_count];
-        memset(dev, 0, sizeof(*dev));
-        g_strlcpy(dev->path, path, sizeof(dev->path));
-
-        if (!prop_dict_get_string(props, "Alias", dev->name, sizeof(dev->name)) &&
-            !prop_dict_get_string(props, "Name", dev->name, sizeof(dev->name))) {
-            prop_dict_get_string(props, "Address", dev->name, sizeof(dev->name));
-        }
-
-        prop_dict_get_string(props, "Address", dev->address, sizeof(dev->address));
-        prop_dict_get_bool(props, "Paired", &dev->paired);
-        prop_dict_get_bool(props, "Connected", &dev->connected);
-        prop_dict_get_int16(props, "RSSI", &dev->rssi);
-
-        g_variant_unref(props);
-        device_count++;
-    }
-
-    g_variant_iter_free(objects_iter);
-
-    if (device_count > 1) {
-        qsort(devices, device_count, sizeof(devices[0]), compare_devices);
-    }
-
-    if (selected_index >= (int)device_count) {
-        selected_index = device_count > 0 ? 0 : -1;
     }
 }
 
@@ -372,9 +410,9 @@ void bluetooth_refresh_devices(void) {
         OBJMGR_INTERFACE,
         "GetManagedObjects",
         NULL,
-        G_VARIANT_TYPE("(a{oa{sa{sv}}})"),
+        G_VARIANT_TYPE("a{oa{sa{sv}}}"),
         G_DBUS_CALL_FLAGS_NONE,
-        5000,
+        3000,
         NULL,
         &error);
 
@@ -518,23 +556,23 @@ void bluetooth_start_scan(void) {
 }
 
 void bluetooth_stop_scan(void) {
-    if (!bluetooth_is_powered()) {
-        scanning = false;
+    if (!scanning) {
         scan_started_at = 0;
         return;
     }
 
-    GError *error = NULL;
-    if (!adapter_call("StopDiscovery", &error)) {
-        if (error) {
-            LV_LOG_WARN("Bluetooth StopDiscovery: %s", error->message);
-            g_error_free(error);
+    if (bluetooth_is_powered()) {
+        GError *error = NULL;
+        if (!adapter_call("StopDiscovery", &error)) {
+            if (error) {
+                LV_LOG_WARN("Bluetooth StopDiscovery: %s", error->message);
+                g_error_free(error);
+            }
         }
     }
 
     scanning = false;
     scan_started_at = 0;
-    refresh_discovering_state();
     notify_devices_changed();
 }
 
