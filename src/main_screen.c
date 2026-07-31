@@ -1095,8 +1095,6 @@ lv_obj_t * main_screen() {
 
     cw_tune_init(obj);
 
-    msg_schedule_text_fmt("X6100 de R1CBU es Others " VERSION);
-
     subject_add_delayed_observer(freq_lock, on_fg_freq_change, NULL);
     subject_add_delayed_observer(cfg_cur.band->split.val, on_fg_freq_change, NULL);
     subject_add_delayed_observer(cfg_cur.fg_freq, on_fg_freq_change, NULL);
