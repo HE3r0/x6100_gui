@@ -2140,7 +2140,7 @@ static void make_info_page() {
     lv_label_set_text_fmt(
         label,
         "MAC6100\n"
-        "Based on X6100 GUI \xC2\xA9 R1CBU\n"
+        "Based on X6100 GUI (c) R1CBU\n"
         "Modified by SO0BAD\n\n"
         "GUI : %s\n"
         "BASE: %s",
