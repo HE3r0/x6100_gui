@@ -333,20 +333,18 @@ static void refresh_buttons(void) {
     }
 }
 
-static void bt_state_changed_cb(void *s, lv_msg_t *m) {
-    (void)s;
-    (void)m;
-
-    update_status_label();
-    refresh_buttons();
-}
-
 static void bt_devices_changed_cb(void *s, lv_msg_t *m) {
     (void)s;
     (void)m;
 
     update_status_label();
     update_devices_table();
-    /* Defer button label refresh to avoid re-entrancy during press handling. */
+}
+
+static void bt_state_changed_cb(void *s, lv_msg_t *m) {
+    (void)s;
+    (void)m;
+
+    update_status_label();
     refresh_buttons();
 }

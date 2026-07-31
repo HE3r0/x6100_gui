@@ -1,10 +1,11 @@
 /*
  *  SPDX-License-Identifier: LGPL-2.1-or-later
  *
- *  MAC6100 / X6100 LVGL GUI — Bluetooth (BlueZ)
+ *  MAC6100 / X6100 LVGL GUI — Bluetooth
  *
- *  Power control may run on the UI thread.
- *  Discovery runs on a dedicated worker thread so D-Bus never blocks LVGL.
+ *  Adapter power uses BlueZ D-Bus on the UI thread (same as before).
+ *  Discovery uses bluetoothctl in a worker thread — no GLib/GDBus there,
+ *  to avoid crashing against NetworkManager's GMainLoop.
  */
 
 #include "bluetooth.h"
@@ -25,12 +26,9 @@
 #define BLUEZ_BUS_NAME      "org.bluez"
 #define ADAPTER_OBJECT_PATH "/org/bluez/hci0"
 #define ADAPTER_INTERFACE   "org.bluez.Adapter1"
-#define DEVICE_INTERFACE    "org.bluez.Device1"
 #define PROPS_INTERFACE     "org.freedesktop.DBus.Properties"
-#define OBJMGR_INTERFACE    "org.freedesktop.DBus.ObjectManager"
 
 #define BT_SCAN_TIMEOUT_SEC 30
-#define BT_SCAN_POLL_MS     1000
 
 typedef enum {
     BT_CMD_NONE = 0,
@@ -43,20 +41,22 @@ static bt_device_info_t devices[BT_MAX_DEVICES];
 static size_t           device_count = 0;
 static int              selected_index = -1;
 
-static pthread_t        worker_thread;
-static pthread_mutex_t  lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t   cond = PTHREAD_COND_INITIALIZER;
-static bool             worker_started = false;
-static bt_cmd_t         pending_cmd = BT_CMD_NONE;
-static bool             scanning = false;
-static time_t           scan_started_at = 0;
+static pthread_t       worker_thread;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  cond = PTHREAD_COND_INITIALIZER;
+static bool            worker_started = false;
+static bt_cmd_t        pending_cmd = BT_CMD_NONE;
+static bool            scanning = false;
+static time_t          scan_started_at = 0;
+static char            worker_msg[64];
+static bool            worker_msg_pending = false;
 
-static lv_timer_t      *restore_timer = NULL;
+static lv_timer_t *restore_timer = NULL;
 
-static bool power_on_internal(bool user_initiated);
+static bool  power_on_internal(bool user_initiated);
 static void *bt_worker_main(void *arg);
-static void ensure_worker(void);
-static void ui_notify_cb(void *arg);
+static void  ensure_worker(void);
+static void  ui_notify_cb(void *arg);
 
 static void set_status(bt_status_t val) {
     if (status == val) {
@@ -71,21 +71,40 @@ static void post_ui_notify(void) {
 }
 
 static void ui_notify_cb(void *arg) {
+    char msg[64];
+    bool have_msg = false;
+
     (void)arg;
+
+    pthread_mutex_lock(&lock);
+    if (worker_msg_pending) {
+        strncpy(msg, worker_msg, sizeof(msg) - 1);
+        msg[sizeof(msg) - 1] = '\0';
+        worker_msg_pending = false;
+        have_msg = true;
+    }
+    pthread_mutex_unlock(&lock);
+
+    if (have_msg && msg[0]) {
+        msg_schedule_text_fmt("%s", msg);
+    }
+
     lv_msg_send(MSG_BT_DEVICES_CHANGED, NULL);
     lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
 }
 
-static GDBusConnection *open_system_bus(GError **error) {
-    return g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, error);
+static void worker_set_msg(const char *text) {
+    pthread_mutex_lock(&lock);
+    strncpy(worker_msg, text ? text : "", sizeof(worker_msg) - 1);
+    worker_msg[sizeof(worker_msg) - 1] = '\0';
+    worker_msg_pending = true;
+    pthread_mutex_unlock(&lock);
 }
 
-static bool dbus_error_is_in_progress(GError *error) {
-    if (!error || !error->message) {
-        return false;
-    }
-    return strstr(error->message, "InProgress") != NULL ||
-           strstr(error->message, "in progress") != NULL;
+/* ---------- D-Bus power (UI thread only) ---------- */
+
+static GDBusConnection *open_system_bus(GError **error) {
+    return g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, error);
 }
 
 static bool adapter_get_bool_prop(const char *prop, bool *out, GError **error) {
@@ -131,43 +150,12 @@ static bool adapter_set_powered(bool powered, GError **error) {
     return false;
 }
 
-static bool adapter_call(const char *method, GError **error) {
-    GDBusConnection *conn = open_system_bus(error);
-    if (!conn) {
-        return false;
-    }
-
-    GError   *local_error = NULL;
-    GVariant *result = g_dbus_connection_call_sync(
-        conn, BLUEZ_BUS_NAME, ADAPTER_OBJECT_PATH, ADAPTER_INTERFACE, method, NULL, NULL,
-        G_DBUS_CALL_FLAGS_NONE, 3000, NULL, &local_error);
-
-    g_object_unref(conn);
-
-    if (result) {
-        g_variant_unref(result);
-        return true;
-    }
-
-    if (dbus_error_is_in_progress(local_error)) {
-        g_error_free(local_error);
-        return true;
-    }
-
-    if (error) {
-        *error = local_error;
-    } else if (local_error) {
-        g_error_free(local_error);
-    }
-    return false;
-}
+/* ---------- bluetoothctl helpers (worker thread only) ---------- */
 
 static void sanitize_name(char *name, size_t size) {
     if (!name || size == 0) {
         return;
     }
-
-    /* Keep only printable ASCII — avoids LVGL UTF-8 edge cases. */
     for (size_t i = 0; name[i] != '\0' && i + 1 < size; i++) {
         unsigned char c = (unsigned char)name[i];
         if (c < 0x20 || c > 0x7e) {
@@ -175,153 +163,79 @@ static void sanitize_name(char *name, size_t size) {
         }
     }
     name[size - 1] = '\0';
-
     if (name[0] == '\0') {
         strncpy(name, "Unknown", size - 1);
         name[size - 1] = '\0';
     }
 }
 
-static bool prop_get_string(GVariant *props, const char *key, char *buf, size_t buf_size) {
-    GVariant *value = g_variant_lookup_value(props, key, G_VARIANT_TYPE_STRING);
-    if (!value) {
-        return false;
-    }
-    strncpy(buf, g_variant_get_string(value, NULL), buf_size - 1);
-    buf[buf_size - 1] = '\0';
-    g_variant_unref(value);
-    return true;
+static int btctl_run(const char *command) {
+    char cmd[320];
+    /*
+     * Keep bluetoothctl off a TTY and bounded. Discovery continues in bluetoothd
+     * after "scan on" returns.
+     */
+    snprintf(cmd, sizeof(cmd),
+             "timeout 3 sh -c \"printf '%%s\\n' '%s' | bluetoothctl\" >/dev/null 2>&1",
+             command);
+    return system(cmd);
 }
 
-static bool prop_get_bool(GVariant *props, const char *key, bool *out) {
-    GVariant *value = g_variant_lookup_value(props, key, G_VARIANT_TYPE_BOOLEAN);
-    if (!value) {
-        return false;
-    }
-    *out = g_variant_get_boolean(value);
-    g_variant_unref(value);
-    return true;
-}
+static size_t btctl_list_devices(bt_device_info_t *out, size_t max) {
+    FILE  *fp;
+    char   line[256];
+    size_t count = 0;
 
-static bool prop_get_rssi(GVariant *props, int16_t *out) {
-    GVariant *value = g_variant_lookup_value(props, "RSSI", NULL);
-    if (!value) {
-        return false;
+    fp = popen("bluetoothctl devices 2>/dev/null", "r");
+    if (!fp) {
+        return 0;
     }
 
-    if (g_variant_is_of_type(value, G_VARIANT_TYPE_INT16)) {
-        *out = g_variant_get_int16(value);
-    } else if (g_variant_is_of_type(value, G_VARIANT_TYPE_INT32)) {
-        *out = (int16_t)g_variant_get_int32(value);
-    } else {
-        g_variant_unref(value);
-        return false;
-    }
+    while (count < max && fgets(line, sizeof(line), fp)) {
+        char addr[32];
+        char name[64];
+        char *p;
 
-    g_variant_unref(value);
-    return true;
-}
-
-static int compare_devices(const void *a, const void *b) {
-    const bt_device_info_t *da = a;
-    const bt_device_info_t *db = b;
-
-    if (da->connected != db->connected) {
-        return (int)db->connected - (int)da->connected;
-    }
-    if (da->paired != db->paired) {
-        return (int)db->paired - (int)da->paired;
-    }
-    return (int)db->rssi - (int)da->rssi;
-}
-
-static void parse_objects_to(GVariant *objects, bt_device_info_t *out, size_t *out_count) {
-    GVariantIter iter;
-    const char  *path = NULL;
-    GVariant    *ifaces = NULL;
-    size_t       count = 0;
-
-    g_variant_iter_init(&iter, objects);
-
-    while (count < BT_MAX_DEVICES &&
-           g_variant_iter_next(&iter, "{&o@a{sa{sv}}}", &path, &ifaces)) {
-        GVariant *props = g_variant_lookup_value(ifaces, DEVICE_INTERFACE, G_VARIANT_TYPE("a{sv}"));
-        g_variant_unref(ifaces);
-        ifaces = NULL;
-
-        if (!props) {
+        /* Device AA:BB:CC:DD:EE:FF Name may have spaces */
+        if (strncmp(line, "Device ", 7) != 0) {
             continue;
         }
 
-        bt_device_info_t *dev = &out[count];
-        memset(dev, 0, sizeof(*dev));
-
-        if (path) {
-            strncpy(dev->path, path, sizeof(dev->path) - 1);
+        name[0] = '\0';
+        if (sscanf(line + 7, "%31s %63[^\n]", addr, name) < 1) {
+            continue;
         }
 
-        if (!prop_get_string(props, "Alias", dev->name, sizeof(dev->name)) &&
-            !prop_get_string(props, "Name", dev->name, sizeof(dev->name))) {
-            prop_get_string(props, "Address", dev->name, sizeof(dev->name));
+        /* trim trailing CR */
+        p = strchr(name, '\r');
+        if (p) {
+            *p = '\0';
         }
-        sanitize_name(dev->name, sizeof(dev->name));
 
-        prop_get_string(props, "Address", dev->address, sizeof(dev->address));
-        prop_get_bool(props, "Paired", &dev->paired);
-        prop_get_bool(props, "Connected", &dev->connected);
-        prop_get_rssi(props, &dev->rssi);
-
-        g_variant_unref(props);
+        memset(&out[count], 0, sizeof(out[count]));
+        strncpy(out[count].address, addr, sizeof(out[count].address) - 1);
+        if (name[0]) {
+            strncpy(out[count].name, name, sizeof(out[count].name) - 1);
+        } else {
+            strncpy(out[count].name, addr, sizeof(out[count].name) - 1);
+        }
+        sanitize_name(out[count].name, sizeof(out[count].name));
+        snprintf(out[count].path, sizeof(out[count].path),
+                 "/org/bluez/hci0/dev_%c%c_%c%c_%c%c_%c%c_%c%c_%c%c",
+                 addr[0], addr[1], addr[3], addr[4], addr[6], addr[7],
+                 addr[9], addr[10], addr[12], addr[13], addr[15], addr[16]);
         count++;
     }
 
-    if (count > 1) {
-        qsort(out, count, sizeof(out[0]), compare_devices);
-    }
-    *out_count = count;
-}
-
-static bool fetch_devices(bt_device_info_t *out, size_t *out_count) {
-    GError          *error = NULL;
-    GDBusConnection *conn = open_system_bus(&error);
-    if (!conn) {
-        if (error) {
-            LV_LOG_WARN("BT bus: %s", error->message);
-            g_error_free(error);
-        }
-        return false;
-    }
-
-    GVariant *result = g_dbus_connection_call_sync(
-        conn, BLUEZ_BUS_NAME, "/", OBJMGR_INTERFACE, "GetManagedObjects", NULL,
-        G_VARIANT_TYPE("a{oa{sa{sv}}}"), G_DBUS_CALL_FLAGS_NONE, 2500, NULL, &error);
-
-    g_object_unref(conn);
-
-    if (!result) {
-        if (error) {
-            LV_LOG_WARN("BT GetManagedObjects: %s", error->message);
-            g_error_free(error);
-        }
-        return false;
-    }
-
-    if (g_variant_is_of_type(result, G_VARIANT_TYPE("a{oa{sa{sv}}}"))) {
-        parse_objects_to(result, out, out_count);
-    } else if (g_variant_is_of_type(result, G_VARIANT_TYPE("(a{oa{sa{sv}}})"))) {
-        GVariant *objects = g_variant_get_child_value(result, 0);
-        parse_objects_to(objects, out, out_count);
-        g_variant_unref(objects);
-    } else {
-        *out_count = 0;
-    }
-
-    g_variant_unref(result);
-    return true;
+    pclose(fp);
+    return count;
 }
 
 static void publish_devices(const bt_device_info_t *src, size_t count) {
     pthread_mutex_lock(&lock);
+    if (count > BT_MAX_DEVICES) {
+        count = BT_MAX_DEVICES;
+    }
     memcpy(devices, src, count * sizeof(bt_device_info_t));
     device_count = count;
     if (selected_index >= (int)device_count) {
@@ -332,17 +246,11 @@ static void publish_devices(const bt_device_info_t *src, size_t count) {
 }
 
 static void worker_start_scan(void) {
-    GError *error = NULL;
-
-    if (!adapter_call("StartDiscovery", &error)) {
-        if (error) {
-            LV_LOG_ERROR("BT StartDiscovery: %s", error->message);
-            msg_schedule_text_fmt("BT scan failed");
-            g_error_free(error);
-        }
+    if (btctl_run("scan on") != 0) {
         pthread_mutex_lock(&lock);
         scanning = false;
         pthread_mutex_unlock(&lock);
+        worker_set_msg("BT scan failed");
         post_ui_notify();
         return;
     }
@@ -352,22 +260,16 @@ static void worker_start_scan(void) {
     scan_started_at = time(NULL);
     pthread_mutex_unlock(&lock);
 
-    msg_schedule_text_fmt("Scanning...");
+    worker_set_msg("Scanning...");
     post_ui_notify();
 
     bt_device_info_t tmp[BT_MAX_DEVICES];
-    size_t           count = 0;
-    if (fetch_devices(tmp, &count)) {
-        publish_devices(tmp, count);
-    }
+    size_t           count = btctl_list_devices(tmp, BT_MAX_DEVICES);
+    publish_devices(tmp, count);
 }
 
 static void worker_stop_scan(const char *msg) {
-    GError *error = NULL;
-    adapter_call("StopDiscovery", &error);
-    if (error) {
-        g_error_free(error);
-    }
+    btctl_run("scan off");
 
     pthread_mutex_lock(&lock);
     scanning = false;
@@ -375,7 +277,7 @@ static void worker_stop_scan(const char *msg) {
     pthread_mutex_unlock(&lock);
 
     if (msg) {
-        msg_schedule_text_fmt("%s", msg);
+        worker_set_msg(msg);
     }
     post_ui_notify();
 }
@@ -401,10 +303,8 @@ static void worker_poll(void) {
     }
 
     bt_device_info_t tmp[BT_MAX_DEVICES];
-    size_t           count = 0;
-    if (fetch_devices(tmp, &count)) {
-        publish_devices(tmp, count);
-    }
+    size_t           count = btctl_list_devices(tmp, BT_MAX_DEVICES);
+    publish_devices(tmp, count);
 }
 
 static void *bt_worker_main(void *arg) {
@@ -448,7 +348,6 @@ static void ensure_worker(void) {
     worker_started = true;
     if (pthread_create(&worker_thread, NULL, bt_worker_main, NULL) != 0) {
         worker_started = false;
-        LV_LOG_ERROR("BT worker thread failed");
         return;
     }
     pthread_detach(worker_thread);
@@ -461,6 +360,8 @@ static void queue_cmd(bt_cmd_t cmd) {
     pthread_cond_signal(&cond);
     pthread_mutex_unlock(&lock);
 }
+
+/* ---------- public API ---------- */
 
 static void restore_timer_cb(lv_timer_t *timer) {
     (void)timer;
@@ -494,7 +395,6 @@ void bluetooth_cancel_restore(void) {
 }
 
 void bluetooth_refresh_devices(void) {
-    /* Discovery list is refreshed by the worker while scanning. */
 }
 
 void bluetooth_refresh_status(void) {
@@ -508,7 +408,6 @@ void bluetooth_refresh_status(void) {
 
     if (!adapter_get_bool_prop("Powered", &powered, &error)) {
         if (error) {
-            LV_LOG_WARN("Bluetooth status: %s", error->message);
             g_error_free(error);
         }
         set_status(BT_STATUS_UNAVAILABLE);
@@ -525,7 +424,6 @@ void bluetooth_power_setup(void) {
     }
 
     bluetooth_refresh_status();
-    ensure_worker();
 
     if (params.bt_enabled.x && status != BT_STATUS_ON) {
         bluetooth_schedule_restore();
@@ -552,7 +450,6 @@ static bool power_on_internal(bool user_initiated) {
     GError *error = NULL;
     if (!adapter_set_powered(true, &error)) {
         if (error) {
-            LV_LOG_WARN("Bluetooth power on: %s", error->message);
             if (user_initiated) {
                 msg_schedule_text_fmt("Bluetooth power on failed");
             }
@@ -590,7 +487,6 @@ void bluetooth_power_off(void) {
     GError *error = NULL;
     if (!adapter_set_powered(false, &error)) {
         if (error) {
-            LV_LOG_ERROR("Bluetooth power off: %s", error->message);
             g_error_free(error);
         }
         bluetooth_refresh_status();
@@ -611,7 +507,6 @@ void bluetooth_start_scan(void) {
     pthread_mutex_lock(&lock);
     already = scanning || pending_cmd == BT_CMD_START_SCAN;
     pthread_mutex_unlock(&lock);
-
     if (already) {
         return;
     }
@@ -668,7 +563,6 @@ size_t bluetooth_copy_devices(bt_device_info_t *out, size_t max) {
 }
 
 const bt_device_info_t *bluetooth_get_device(size_t index) {
-    /* Prefer bluetooth_copy_devices() from UI code. */
     if (index >= device_count) {
         return NULL;
     }
