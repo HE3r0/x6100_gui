@@ -3,8 +3,9 @@
  *
  *  MAC6100 / X6100 LVGL GUI — Bluetooth
  *
- *  All BlueZ D-Bus work runs asynchronously on the default GLib main
- *  context (already pumped by wifi.cpp). No worker threads, no system().
+ *  BlueZ D-Bus is async on the default GLib context (pumped from wifi's
+ *  LVGL timer). UI updates are always deferred via scheduler_put so we
+ *  never touch LVGL from inside g_main_context_iteration / lv_timer_handler.
  */
 
 #include "bluetooth.h"
@@ -12,6 +13,7 @@
 #include "params/params.h"
 #include "pubsub_ids.h"
 #include "msg.h"
+#include "scheduler.h"
 
 #include "lvgl/lvgl.h"
 #include <gio/gio.h>
@@ -41,11 +43,14 @@ static bool             scan_busy = false;
 static uint32_t         scan_started_tick = 0;
 static lv_timer_t      *scan_timer = NULL;
 static lv_timer_t      *restore_timer = NULL;
+static char             pending_toast[64];
+static bool             pending_toast_set = false;
 
 static bool power_on_internal(bool user_initiated);
 static void ensure_bus(void);
 static void bt_log(const char *msg);
-static void notify_ui(void);
+static void schedule_ui_notify(void);
+static void ui_notify_cb(void *arg);
 static void refresh_devices_async(void);
 static void stop_discovery_async(const char *reason);
 static void scan_timer_cb(lv_timer_t *timer);
@@ -55,11 +60,7 @@ static void set_status(bt_status_t val) {
         return;
     }
     status = val;
-    lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
-}
-
-static void notify_ui(void) {
-    lv_msg_send(MSG_BT_DEVICES_CHANGED, NULL);
+    /* Safe: only called from UI / power paths, not from GLib D-Bus callbacks. */
     lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
 }
 
@@ -70,6 +71,43 @@ static void bt_log(const char *msg) {
     }
     fprintf(fp, "%u %s\n", (unsigned)lv_tick_get(), msg ? msg : "");
     fclose(fp);
+}
+
+static void schedule_ui_notify(void) {
+    scheduler_put_noargs(ui_notify_cb);
+}
+
+static void ui_notify_cb(void *arg) {
+    (void)arg;
+
+    bt_log("ui_notify");
+
+    if (pending_toast_set) {
+        pending_toast_set = false;
+        msg_schedule_text_fmt("%s", pending_toast);
+    }
+
+    /* Ensure scan timer exists/resumed while scanning (LVGL APIs only here). */
+    if (scanning) {
+        if (!scan_timer) {
+            scan_timer = lv_timer_create(scan_timer_cb, BT_SCAN_POLL_MS, NULL);
+            bt_log("scan_timer created");
+        } else {
+            lv_timer_resume(scan_timer);
+        }
+    } else if (scan_timer) {
+        lv_timer_pause(scan_timer);
+    }
+
+    lv_msg_send(MSG_BT_DEVICES_CHANGED, NULL);
+    lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
+    bt_log("ui_notify done");
+}
+
+static void queue_toast(const char *text) {
+    strncpy(pending_toast, text ? text : "", sizeof(pending_toast) - 1);
+    pending_toast[sizeof(pending_toast) - 1] = '\0';
+    pending_toast_set = true;
 }
 
 static void ensure_bus(void) {
@@ -245,6 +283,7 @@ static void get_managed_objects_cb(GObject *source, GAsyncResult *res, gpointer 
 
     (void)user_data;
     scan_busy = false;
+    bt_log("objects_cb");
 
     result = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
     if (!result) {
@@ -255,6 +294,7 @@ static void get_managed_objects_cb(GObject *source, GAsyncResult *res, gpointer 
         return;
     }
 
+    bt_log("objects_parse");
     if (g_variant_is_of_type(result, G_VARIANT_TYPE("a{oa{sa{sv}}}"))) {
         parse_objects(result);
     } else if (g_variant_is_of_type(result, G_VARIANT_TYPE("(a{oa{sa{sv}}})"))) {
@@ -266,14 +306,16 @@ static void get_managed_objects_cb(GObject *source, GAsyncResult *res, gpointer 
     }
 
     g_variant_unref(result);
-    notify_ui();
+    bt_log("objects_done");
+    schedule_ui_notify();
 }
 
 static void refresh_devices_async(void) {
-    if (!bus || scan_busy) {
+    if (!bus || scan_busy || !scanning) {
         return;
     }
 
+    bt_log("objects_req");
     scan_busy = true;
     g_dbus_connection_call(bus, BLUEZ_BUS_NAME, "/", OBJMGR_INTERFACE, "GetManagedObjects", NULL,
                            NULL, G_DBUS_CALL_FLAGS_NONE, 2500, NULL, get_managed_objects_cb, NULL);
@@ -289,32 +331,28 @@ static void stop_discovery_cb(GObject *source, GAsyncResult *res, gpointer user_
         g_variant_unref(result);
     }
     if (error) {
-        /* Ignore InProgress / not discovering */
         g_error_free(error);
     }
 
     scanning = false;
     scan_started_tick = 0;
-    if (scan_timer) {
-        lv_timer_pause(scan_timer);
-    }
-
-    if (reason) {
-        msg_schedule_text_fmt("%s", reason);
-        g_free(reason);
-    }
     bt_log("scan stopped");
-    notify_ui();
+    if (reason && reason[0]) {
+        queue_toast(reason);
+    }
+    g_free(reason);
+    schedule_ui_notify();
 }
 
 static void stop_discovery_async(const char *reason) {
     ensure_bus();
     if (!bus) {
         scanning = false;
-        notify_ui();
+        schedule_ui_notify();
         return;
     }
 
+    bt_log("stop_req");
     g_dbus_connection_call(bus, BLUEZ_BUS_NAME, ADAPTER_OBJECT_PATH, ADAPTER_INTERFACE,
                            "StopDiscovery", NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL,
                            stop_discovery_cb, g_strdup(reason ? reason : ""));
@@ -325,6 +363,8 @@ static void start_discovery_cb(GObject *source, GAsyncResult *res, gpointer user
     GVariant *result;
 
     (void)user_data;
+    bt_log("start_cb");
+
     result = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
     if (!result) {
         bool in_progress = error && error->message && strstr(error->message, "InProgress");
@@ -333,9 +373,9 @@ static void start_discovery_cb(GObject *source, GAsyncResult *res, gpointer user
             g_error_free(error);
         }
         if (!in_progress) {
-            msg_schedule_text_fmt("BT scan failed");
+            queue_toast("BT scan failed");
             scanning = false;
-            notify_ui();
+            schedule_ui_notify();
             return;
         }
     } else {
@@ -344,15 +384,10 @@ static void start_discovery_cb(GObject *source, GAsyncResult *res, gpointer user
 
     scanning = true;
     scan_started_tick = lv_tick_get();
-    if (!scan_timer) {
-        scan_timer = lv_timer_create(scan_timer_cb, BT_SCAN_POLL_MS, NULL);
-    } else {
-        lv_timer_resume(scan_timer);
-    }
-
-    msg_schedule_text_fmt("Scanning...");
+    queue_toast("Scanning...");
     bt_log("scan running");
-    notify_ui();
+    schedule_ui_notify();
+    /* Device list refresh from scan_timer / after UI notify path */
     refresh_devices_async();
 }
 
@@ -360,7 +395,9 @@ static void scan_timer_cb(lv_timer_t *timer) {
     (void)timer;
 
     if (!scanning) {
-        lv_timer_pause(scan_timer);
+        if (scan_timer) {
+            lv_timer_pause(scan_timer);
+        }
         return;
     }
 
@@ -517,7 +554,6 @@ void bluetooth_start_scan(void) {
         return;
     }
 
-    /* Non-blocking: completion runs on GLib context (wifi timer). */
     g_dbus_connection_call(bus, BLUEZ_BUS_NAME, ADAPTER_OBJECT_PATH, ADAPTER_INTERFACE,
                            "StartDiscovery", NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL,
                            start_discovery_cb, NULL);
