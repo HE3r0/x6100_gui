@@ -2133,22 +2133,19 @@ static void make_info_page() {
     lv_obj_set_style_text_color(grid, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_pad_hor(grid, 30, 0);
-    lv_obj_set_style_pad_ver(grid, 40, 0);
+    lv_obj_set_style_pad_ver(grid, 20, 0);
 
     label = lv_label_create(grid);
-    lv_obj_set_style_text_line_space(label, 20, LV_PART_MAIN);
+    lv_obj_set_style_text_line_space(label, 8, LV_PART_MAIN);
     lv_label_set_text_fmt(
-    label,
-    "Mac6100\n\n"
-    "GUI : %s\n"
-    "BASE: %s\n\n"
-    "Based on\n"
-    "X6100 GUI\n"
-    "\xC2\xA9 R1CBU\n\n"
-    "Modified by\n"
-    "SO0BAD",
-    VERSION,
-    x6100_control_get_fw_version_str());
+        label,
+        "MAC6100\n"
+        "Based on X6100 GUI \xC2\xA9 R1CBU\n"
+        "Modified by SO0BAD\n\n"
+        "GUI : %s\n"
+        "BASE: %s",
+        VERSION,
+        x6100_control_get_fw_version_str());
 }
 
 static void construct_cb(lv_obj_t *parent) {
