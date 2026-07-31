@@ -2137,7 +2137,18 @@ static void make_info_page() {
 
     label = lv_label_create(grid);
     lv_obj_set_style_text_line_space(label, 20, LV_PART_MAIN);
-    lv_label_set_text_fmt(label, "App version: %s\nBASE version: %s", VERSION, x6100_control_get_fw_version_str());
+    lv_label_set_text_fmt(
+    label,
+    "Mac6100\n\n"
+    "GUI : %s\n"
+    "BASE: %s\n\n"
+    "Based on\n"
+    "X6100 GUI\n"
+    "\xC2\xA9 R1CBU\n\n"
+    "Modified by\n"
+    "SO0BAD",
+    VERSION,
+    x6100_control_get_fw_version_str());
 }
 
 static void construct_cb(lv_obj_t *parent) {
