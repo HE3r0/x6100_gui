@@ -23,28 +23,28 @@
 #define PROPS_INTERFACE     "org.freedesktop.DBus.Properties"
 #define OBJMGR_INTERFACE    "org.freedesktop.DBus.ObjectManager"
 
-#define BT_SCAN_TIMEOUT_MS   30000
-#define BT_SCAN_POLL_MS      1000
+#define BT_SCAN_TIMEOUT_MS 30000
+#define BT_SCAN_POLL_MS    1000
+
+enum {
+    SCAN_IDLE = 0,
+    SCAN_START_PENDING,
+    SCAN_RUNNING,
+    SCAN_STOP_PENDING,
+};
 
 static bt_status_t      status = BT_STATUS_UNAVAILABLE;
-static bool             scanning = false;
+static int              scan_state = SCAN_IDLE;
 static uint32_t         scan_started_tick = 0;
 static bt_device_info_t devices[BT_MAX_DEVICES];
 static size_t           device_count = 0;
 static int              selected_index = -1;
 static lv_timer_t      *restore_timer = NULL;
 static lv_timer_t      *scan_timer = NULL;
-static bool             scan_stop_requested = false;
-static bool             scan_start_requested = false;
-static bool             dbus_busy = false;
 
 static bool power_on_internal(bool user_initiated);
 static void scan_timer_cb(lv_timer_t *timer);
 static void ensure_scan_timer(void);
-static void stop_scan_timer(void);
-static bool discovery_start(void);
-static bool discovery_stop(void);
-static void refresh_devices_internal(void);
 
 static void set_status(bt_status_t val) {
     if (status == val) {
@@ -54,8 +54,9 @@ static void set_status(bt_status_t val) {
     lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
 }
 
-static void notify_devices_changed(void) {
+static void notify_ui(void) {
     lv_msg_send(MSG_BT_DEVICES_CHANGED, NULL);
+    lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
 }
 
 static GDBusConnection *open_system_bus(GError **error) {
@@ -171,50 +172,6 @@ static bool adapter_call(const char *method, GError **error) {
     return false;
 }
 
-static bool adapter_set_discovery_filter(void) {
-    GError          *error = NULL;
-    GDBusConnection *conn = open_system_bus(&error);
-    if (!conn) {
-        if (error) {
-            LV_LOG_WARN("Bluetooth filter bus: %s", error->message);
-            g_error_free(error);
-        }
-        return false;
-    }
-
-    GVariantBuilder builder;
-    g_variant_builder_init(&builder, G_VARIANT_TYPE("a{sv}"));
-    g_variant_builder_add(&builder, "{sv}", "Transport", g_variant_new_string("auto"));
-    g_variant_builder_add(&builder, "{sv}", "DuplicateData", g_variant_new_boolean(FALSE));
-
-    GVariant *result = g_dbus_connection_call_sync(
-        conn,
-        BLUEZ_BUS_NAME,
-        ADAPTER_OBJECT_PATH,
-        ADAPTER_INTERFACE,
-        "SetDiscoveryFilter",
-        g_variant_new("(a{sv})", &builder),
-        NULL,
-        G_DBUS_CALL_FLAGS_NONE,
-        3000,
-        NULL,
-        &error);
-
-    g_object_unref(conn);
-
-    if (result) {
-        g_variant_unref(result);
-        return true;
-    }
-
-    if (error) {
-        /* Filter is optional — older stacks may lack it. */
-        LV_LOG_WARN("Bluetooth SetDiscoveryFilter: %s", error->message);
-        g_error_free(error);
-    }
-    return false;
-}
-
 static bool prop_dict_get_string(GVariant *props, const char *key, char *buf, size_t buf_size) {
     GVariant *value = g_variant_lookup_value(props, key, G_VARIANT_TYPE("s"));
     if (!value) {
@@ -267,13 +224,9 @@ static int compare_devices(const void *a, const void *b) {
     return db->rssi - da->rssi;
 }
 
-static void clear_devices(void) {
-    bool had_devices = device_count > 0;
+static void clear_devices_silent(void) {
     device_count = 0;
     selected_index = -1;
-    if (had_devices) {
-        notify_devices_changed();
-    }
 }
 
 static void sanitize_name(char *name, size_t size) {
@@ -354,9 +307,6 @@ static void parse_managed_objects(GVariant *result) {
         g_variant_unref(objects);
         return;
     }
-
-    LV_LOG_WARN("Bluetooth: unexpected GetManagedObjects type %s",
-                g_variant_get_type_string(result));
 }
 
 static void restore_timer_cb(lv_timer_t *timer) {
@@ -396,9 +346,6 @@ void bluetooth_cancel_restore(void) {
 
 static bool discovery_start(void) {
     GError *error = NULL;
-
-    adapter_set_discovery_filter();
-
     if (!adapter_call("StartDiscovery", &error)) {
         if (error) {
             LV_LOG_ERROR("Bluetooth StartDiscovery: %s", error->message);
@@ -410,16 +357,14 @@ static bool discovery_start(void) {
     return true;
 }
 
-static bool discovery_stop(void) {
+static void discovery_stop(void) {
     GError *error = NULL;
     if (!adapter_call("StopDiscovery", &error)) {
         if (error) {
             LV_LOG_WARN("Bluetooth StopDiscovery: %s", error->message);
             g_error_free(error);
         }
-        return false;
     }
-    return true;
 }
 
 static void refresh_devices_internal(void) {
@@ -427,7 +372,6 @@ static void refresh_devices_internal(void) {
     GDBusConnection *conn = open_system_bus(&error);
     if (!conn) {
         if (error) {
-            LV_LOG_WARN("Bluetooth devices bus: %s", error->message);
             g_error_free(error);
         }
         return;
@@ -446,25 +390,6 @@ static void refresh_devices_internal(void) {
         NULL,
         &error);
 
-    if (!result) {
-        if (error) {
-            g_error_free(error);
-            error = NULL;
-        }
-        result = g_dbus_connection_call_sync(
-            conn,
-            BLUEZ_BUS_NAME,
-            "/org/bluez",
-            OBJMGR_INTERFACE,
-            "GetManagedObjects",
-            NULL,
-            G_VARIANT_TYPE("a{oa{sa{sv}}}"),
-            G_DBUS_CALL_FLAGS_NONE,
-            2500,
-            NULL,
-            &error);
-    }
-
     g_object_unref(conn);
 
     if (!result) {
@@ -477,116 +402,82 @@ static void refresh_devices_internal(void) {
 
     parse_managed_objects(result);
     g_variant_unref(result);
-    notify_devices_changed();
-}
-
-static void finish_scan(const char *msg) {
-    if (scanning && bluetooth_is_powered()) {
-        discovery_stop();
-    }
-
-    scanning = false;
-    scan_started_tick = 0;
-    scan_start_requested = false;
-    scan_stop_requested = false;
-
-    /* Never delete the timer from inside its callback — just pause it. */
-    if (scan_timer) {
-        lv_timer_pause(scan_timer);
-    }
-
-    if (msg) {
-        msg_schedule_text_fmt("%s", msg);
-    }
-    notify_devices_changed();
-    lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
 }
 
 static void ensure_scan_timer(void) {
     if (!scan_timer) {
         scan_timer = lv_timer_create(scan_timer_cb, BT_SCAN_POLL_MS, NULL);
-    } else {
-        lv_timer_resume(scan_timer);
-    }
-}
-
-static void stop_scan_timer(void) {
-    if (scan_timer) {
-        lv_timer_del(scan_timer);
-        scan_timer = NULL;
     }
 }
 
 static void scan_timer_cb(lv_timer_t *timer) {
     (void)timer;
 
-    if (dbus_busy) {
-        return;
-    }
-    dbus_busy = true;
-
-    if (scan_stop_requested) {
-        finish_scan("Scan stopped");
-        dbus_busy = false;
+    if (scan_state == SCAN_IDLE) {
         return;
     }
 
-    if (scan_start_requested) {
-        scan_start_requested = false;
-
+    if (scan_state == SCAN_START_PENDING) {
         if (!bluetooth_is_powered()) {
-            finish_scan(NULL);
+            scan_state = SCAN_IDLE;
             msg_schedule_text_fmt("Turn Bluetooth on first");
-            dbus_busy = false;
+            notify_ui();
             return;
         }
 
         if (!discovery_start()) {
-            finish_scan(NULL);
-            dbus_busy = false;
+            scan_state = SCAN_IDLE;
+            notify_ui();
             return;
         }
 
-        scanning = true;
+        scan_state = SCAN_RUNNING;
         scan_started_tick = lv_tick_get();
-        notify_devices_changed();
-        lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
+        clear_devices_silent();
         refresh_devices_internal();
-        dbus_busy = false;
+        msg_schedule_text_fmt("Scanning...");
+        notify_ui();
         return;
     }
 
-    if (!scanning) {
-        if (scan_timer) {
-            lv_timer_pause(scan_timer);
+    if (scan_state == SCAN_STOP_PENDING) {
+        if (bluetooth_is_powered()) {
+            discovery_stop();
         }
-        dbus_busy = false;
+        scan_state = SCAN_IDLE;
+        scan_started_tick = 0;
+        msg_schedule_text_fmt("Scan stopped");
+        notify_ui();
         return;
     }
 
+    /* SCAN_RUNNING */
     if (!bluetooth_is_powered()) {
-        finish_scan(NULL);
-        dbus_busy = false;
+        scan_state = SCAN_IDLE;
+        scan_started_tick = 0;
+        notify_ui();
         return;
     }
 
     if (lv_tick_elaps(scan_started_tick) >= BT_SCAN_TIMEOUT_MS) {
-        finish_scan("Scan timeout");
-        dbus_busy = false;
+        discovery_stop();
+        scan_state = SCAN_IDLE;
+        scan_started_tick = 0;
+        msg_schedule_text_fmt("Scan timeout");
+        notify_ui();
         return;
     }
 
     refresh_devices_internal();
-    dbus_busy = false;
+    notify_ui();
 }
 
 void bluetooth_refresh_devices(void) {
-    if (dbus_busy || !bluetooth_is_powered()) {
+    if (!bluetooth_is_powered()) {
         return;
     }
-    dbus_busy = true;
     refresh_devices_internal();
-    dbus_busy = false;
+    notify_ui();
 }
 
 void bluetooth_refresh_status(void) {
@@ -665,15 +556,13 @@ void bluetooth_power_on(void) {
 
 void bluetooth_power_off(void) {
     bluetooth_cancel_restore();
-    scan_start_requested = false;
-    scan_stop_requested = false;
-    if (scanning && status == BT_STATUS_ON) {
+
+    if (scan_state == SCAN_RUNNING || scan_state == SCAN_STOP_PENDING) {
         discovery_stop();
     }
-    scanning = false;
+    scan_state = SCAN_IDLE;
     scan_started_tick = 0;
-    stop_scan_timer();
-    clear_devices();
+    clear_devices_silent();
 
     if (!params.wifi_enabled.x) {
         params_bool_set(&params.bt_enabled, false);
@@ -696,51 +585,37 @@ void bluetooth_power_off(void) {
 }
 
 void bluetooth_start_scan(void) {
+    /* Button-safe: only queue work for the scan timer. No D-Bus / no lv_msg here. */
     if (!bluetooth_is_powered()) {
-        msg_schedule_text_fmt("Turn Bluetooth on first");
         return;
     }
 
-    if (scanning || scan_start_requested) {
+    if (scan_state == SCAN_RUNNING || scan_state == SCAN_START_PENDING) {
         return;
     }
 
-    scan_stop_requested = false;
-    scan_start_requested = true;
+    scan_state = SCAN_START_PENDING;
     ensure_scan_timer();
-    if (scan_timer) {
-        lv_timer_ready(scan_timer);
-    }
-    notify_devices_changed();
-    lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
 }
 
 void bluetooth_stop_scan(void) {
-    scan_start_requested = false;
-
-    if (dbus_busy) {
-        scan_stop_requested = true;
-        ensure_scan_timer();
-        if (scan_timer) {
-            lv_timer_ready(scan_timer);
-        }
+    /* Button-safe: only queue work for the scan timer. */
+    if (scan_state == SCAN_IDLE) {
         return;
     }
 
-    if (!scanning) {
-        if (scan_timer) {
-            lv_timer_pause(scan_timer);
-        }
+    if (scan_state == SCAN_START_PENDING) {
+        scan_state = SCAN_IDLE;
         return;
     }
 
-    dbus_busy = true;
-    finish_scan("Scan stopped");
-    dbus_busy = false;
+    scan_state = SCAN_STOP_PENDING;
+    ensure_scan_timer();
 }
 
 bool bluetooth_scanning(void) {
-    return scanning || scan_start_requested;
+    return scan_state == SCAN_RUNNING || scan_state == SCAN_START_PENDING ||
+           scan_state == SCAN_STOP_PENDING;
 }
 
 size_t bluetooth_device_count(void) {

@@ -135,6 +135,7 @@ static void construct_cb(lv_obj_t *parent) {
 }
 
 static void destruct_cb(void) {
+    /* Force scan machine idle; timer may still stop BlueZ discovery next tick. */
     bluetooth_stop_scan();
 
     if (subscription_state) {
@@ -211,16 +212,25 @@ static void start_scan_cb(button_data_t *btn_data) {
         return;
     }
 
+    /* Do not refresh buttons / send msgs here — that re-enters LVGL mid-press. */
     if (bluetooth_scanning()) {
         bluetooth_stop_scan();
-        msg_update_text_fmt("Stopping scan...");
+        if (label_scan) {
+            lv_label_set_text(label_scan, "Stopping...");
+        }
     } else {
         bluetooth_start_scan();
-        msg_update_text_fmt("Starting scan...");
+        if (label_scan) {
+            lv_label_set_text(label_scan, "Starting...");
+        }
+        if (device_table) {
+            updating_table = true;
+            lv_table_set_row_cnt(device_table, 1);
+            lv_table_set_cell_value(device_table, 0, 0, "Scanning...");
+            lv_table_set_cell_user_data(device_table, 0, 0, (void *)(intptr_t)-1);
+            updating_table = false;
+        }
     }
-
-    update_status_label();
-    refresh_buttons();
 }
 
 static const char *bt_on_off_label_getter(void) {
@@ -353,5 +363,6 @@ static void bt_devices_changed_cb(void *s, lv_msg_t *m) {
 
     update_status_label();
     update_devices_table();
+    /* Defer button label refresh to avoid re-entrancy during press handling. */
     refresh_buttons();
 }
