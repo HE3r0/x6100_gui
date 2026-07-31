@@ -32,6 +32,9 @@ static time_t           scan_started_at = 0;
 static bt_device_info_t devices[BT_MAX_DEVICES];
 static size_t           device_count = 0;
 static int              selected_index = -1;
+static lv_timer_t      *restore_timer = NULL;
+
+static bool power_on_internal(bool user_initiated);
 
 static void set_status(bt_status_t val) {
     if (status == val) {
@@ -220,6 +223,41 @@ static void clear_devices(void) {
     notify_devices_changed();
 }
 
+static void restore_timer_cb(lv_timer_t *timer) {
+    (void)timer;
+    restore_timer = NULL;
+
+    if (!params.wifi_enabled.x || !params.bt_enabled.x) {
+        return;
+    }
+
+    if (bluetooth_is_powered()) {
+        return;
+    }
+
+    power_on_internal(false);
+}
+
+void bluetooth_schedule_restore(void) {
+    if (!params.wifi_enabled.x || !params.bt_enabled.x) {
+        return;
+    }
+
+    if (restore_timer) {
+        lv_timer_del(restore_timer);
+    }
+
+    restore_timer = lv_timer_create(restore_timer_cb, 2000, NULL);
+    lv_timer_set_repeat_count(restore_timer, 1);
+}
+
+void bluetooth_cancel_restore(void) {
+    if (restore_timer) {
+        lv_timer_del(restore_timer);
+        restore_timer = NULL;
+    }
+}
+
 static void parse_managed_objects(GVariant *result) {
     GVariantIter *objects_iter = NULL;
     const char   *path = NULL;
@@ -379,10 +417,10 @@ void bluetooth_power_setup(void) {
         return;
     }
 
-    if (params.bt_enabled.x) {
-        bluetooth_power_on();
-    } else {
-        bluetooth_refresh_status();
+    bluetooth_refresh_status();
+
+    if (params.bt_enabled.x && status != BT_STATUS_ON) {
+        bluetooth_schedule_restore();
     }
 }
 
@@ -394,29 +432,40 @@ bool bluetooth_is_powered(void) {
     return status == BT_STATUS_ON;
 }
 
-void bluetooth_power_on(void) {
+static bool power_on_internal(bool user_initiated) {
     if (!params.wifi_enabled.x) {
-        msg_schedule_text_fmt("Turn WiFi radio on first");
+        if (user_initiated) {
+            msg_schedule_text_fmt("Turn WiFi radio on first");
+        }
         set_status(BT_STATUS_UNAVAILABLE);
-        return;
+        return false;
     }
 
     GError *error = NULL;
     if (!adapter_set_powered(true, &error)) {
         if (error) {
-            LV_LOG_ERROR("Bluetooth power on: %s", error->message);
-            msg_schedule_text_fmt("Bluetooth power on failed");
+            LV_LOG_WARN("Bluetooth power on: %s", error->message);
+            if (user_initiated) {
+                msg_schedule_text_fmt("Bluetooth power on failed");
+            }
             g_error_free(error);
         }
         bluetooth_refresh_status();
-        return;
+        return false;
     }
 
     params_bool_set(&params.bt_enabled, true);
     set_status(BT_STATUS_ON);
+    return true;
+}
+
+void bluetooth_power_on(void) {
+    bluetooth_cancel_restore();
+    power_on_internal(true);
 }
 
 void bluetooth_power_off(void) {
+    bluetooth_cancel_restore();
     bluetooth_stop_scan();
     clear_devices();
 

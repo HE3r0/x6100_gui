@@ -98,7 +98,7 @@ void wifi_power_on() {
     }
     lv_msg_send(MSG_WIFI_STATE_CHANGED, NULL);
     if (params.bt_enabled.x) {
-        bluetooth_power_on();
+        bluetooth_schedule_restore();
     } else {
         bluetooth_refresh_status();
         lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
@@ -118,6 +118,7 @@ void wifi_power_off() {
         scan_timer = NULL;
     }
     scanning = false;
+    bluetooth_cancel_restore();
     bluetooth_refresh_status();
     lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
 }

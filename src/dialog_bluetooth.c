@@ -136,7 +136,8 @@ static void construct_cb(lv_obj_t *parent) {
 
     subscription_state = lv_msg_subscribe(MSG_BT_STATE_CHANGED, bt_state_changed_cb, NULL);
     subscription_devices = lv_msg_subscribe(MSG_BT_DEVICES_CHANGED, bt_devices_changed_cb, NULL);
-    lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
+    update_status_label();
+    update_devices_table();
 }
 
 static void destruct_cb(void) {
@@ -173,11 +174,20 @@ static void device_selected_cb(lv_event_t *e) {
         return;
     }
 
-    char *end = NULL;
-    long  index = strtol((const char *)lv_table_get_cell_user_data(obj, row, col), &end, 10);
-    if (end) {
-        bluetooth_set_selected_index((int)index);
+    const char *user_data = (const char *)lv_table_get_cell_user_data(obj, row, col);
+    if (!user_data || user_data[0] == '\0') {
+        bluetooth_set_selected_index(-1);
+        return;
     }
+
+    char *end = NULL;
+    long  index = strtol(user_data, &end, 10);
+    if (end == user_data || (end && *end != '\0')) {
+        bluetooth_set_selected_index(-1);
+        return;
+    }
+
+    bluetooth_set_selected_index((int)index);
 }
 
 static void bt_power_toggle_cb(button_data_t *btn_data) {
@@ -339,13 +349,12 @@ static void bt_state_changed_cb(void *s, lv_msg_t *m) {
     (void)s;
     (void)m;
 
-    bluetooth_refresh_status();
     update_status_label();
 
     if (!bluetooth_is_powered()) {
         bluetooth_stop_scan();
         update_devices_table();
-    } else {
+    } else if (device_table) {
         bluetooth_refresh_devices();
         update_devices_table();
     }

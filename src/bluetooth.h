@@ -29,6 +29,10 @@ typedef struct {
 
 void bluetooth_power_setup(void);
 
+void bluetooth_schedule_restore(void);
+
+void bluetooth_cancel_restore(void);
+
 bt_status_t bluetooth_get_status(void);
 
 bool bluetooth_is_powered(void);
