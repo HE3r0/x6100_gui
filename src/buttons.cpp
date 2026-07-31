@@ -321,6 +321,7 @@ static button_data_t btn_callsign = make_action_btn("Callsign", ACTION_APP_CALLS
 static button_data_t btn_settings = make_app_btn("Settings", ACTION_APP_SETTINGS);
 
 static button_data_t  btn_wifi   = make_app_btn("WiFi", ACTION_APP_WIFI);
+static button_data_t  btn_bt     = make_app_btn("BT", ACTION_APP_BLUETOOTH);
 
 /* RTTY */
 static button_data_t btn_rtty_p1 = {
@@ -451,7 +452,7 @@ static buttons_page_t page_app_2 = {
     {&btn_app_p2, &btn_rec, &btn_qth, &btn_callsign, &btn_settings}
 };
 static buttons_page_t page_app_3 = {
-    {&btn_app_p3, &btn_wifi}
+    {&btn_app_p3, &btn_wifi, &btn_bt}
 };
 
 /* RTTY */
@@ -594,6 +595,9 @@ void buttons_init(lv_obj_t *parent) {
 }
 
 void buttons_refresh(button_data_t *data) {
+    if (!data) {
+        return;
+    }
     if (data->disp_btn) {
         disp_btn_refresh(data->disp_btn);
     } else {

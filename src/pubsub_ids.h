@@ -11,5 +11,6 @@
 // Messages IDs for UI part messaging (publishing/subscribing)
 enum {
     MSG_WIFI_STATE_CHANGED,
+    MSG_BT_STATE_CHANGED,
     MSG_USB_DEVICE_CHANGED,
 };

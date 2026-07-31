@@ -41,7 +41,7 @@ static void cell_selected_cb(lv_event_t *e);
 static void ap_table_draw_event_cb(lv_event_t *e);
 
 // button callbacks
-static void wifi_bt_toggle_cb(button_data_t *btn_data);
+static void wifi_power_toggle_cb(button_data_t *btn_data);
 static void start_scan_cb(button_data_t *btn_data);
 static void connect_cb(button_data_t *btn_data);
 static void con_change_passwd_cb(button_data_t *btn_data);
@@ -71,7 +71,7 @@ static void wifi_state_changed_cb(void *s, lv_msg_t *m);
 static button_data_t btn_on_off = {
     .type     = BTN_TEXT_FN,
     .label_fn = wifi_on_off_label_getter,
-    .press    = wifi_bt_toggle_cb,
+    .press    = wifi_power_toggle_cb,
 };
 static button_data_t btn_scan = {
     .type     = BTN_TEXT_FN,
@@ -271,7 +271,7 @@ static void cell_selected_cb(lv_event_t *e) {
 
 /* Buttons callbacks */
 
-static void wifi_bt_toggle_cb(button_data_t *btn_data) {
+static void wifi_power_toggle_cb(button_data_t *btn_data) {
     if (disable_buttons)
         return;
     if (params.wifi_enabled.x) {
@@ -379,11 +379,11 @@ static void con_delete_cb(button_data_t *btn_data) {
 static const char *wifi_on_off_label_getter() {
     switch (wifi_get_status()) {
     case WIFI_OFF:
-        return "Wifi/BT:\nOff";
+        return "WiFi:\nOff";
     case WIFI_STARTING:
-        return "Wifi/BT:\nStarting...";
+        return "WiFi:\nStarting...";
     default:
-        return "Wifi/BT:\nOn";
+        return "WiFi:\nOn";
     }
 }
 

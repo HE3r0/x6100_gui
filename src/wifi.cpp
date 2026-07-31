@@ -15,6 +15,7 @@ extern "C" {
 #include "msg.h"
 #include "params/params.h"
 #include "pubsub_ids.h"
+#include "bluetooth.h"
 
 #include <aether_radio/x6100_control/low/gpio.h>
 #include <glib.h>
@@ -89,17 +90,23 @@ void wifi_power_setup() {
 }
 
 void wifi_power_on() {
-    LV_LOG_USER("Power on wifi/bt");
+    LV_LOG_USER("Power on WiFi radio");
     params_bool_set(&params.wifi_enabled, true);
     x6100_gpio_set(x6100_pin_wifi, 0);
     if (!device) {
         set_status(WIFI_STARTING);
     }
     lv_msg_send(MSG_WIFI_STATE_CHANGED, NULL);
+    if (params.bt_enabled.x) {
+        bluetooth_power_on();
+    } else {
+        bluetooth_refresh_status();
+        lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
+    }
 }
 
 void wifi_power_off() {
-    LV_LOG_USER("Power off wifi/bt");
+    LV_LOG_USER("Power off WiFi radio");
     set_status(WIFI_OFF);
     if (device) {
         device = NULL;
@@ -111,6 +118,8 @@ void wifi_power_off() {
         scan_timer = NULL;
     }
     scanning = false;
+    bluetooth_refresh_status();
+    lv_msg_send(MSG_BT_STATE_CHANGED, NULL);
 }
 
 // void wifi_set_change_ap_callbacks(wifi_ap_change_cb add_cb, wifi_ap_change_cb del_cb) {

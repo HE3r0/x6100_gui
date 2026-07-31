@@ -47,6 +47,7 @@ typedef enum {
     ACTION_APP_QTH,
     ACTION_APP_CALLSIGN,
     ACTION_APP_WIFI,
+    ACTION_APP_BLUETOOTH,
 } press_action_t;
 
 typedef enum {
@@ -157,6 +158,7 @@ typedef struct {
     /* WiFi / BT */
 
     params_bool_t       wifi_enabled;
+    params_bool_t       bt_enabled;
 
     /* Theme */
 

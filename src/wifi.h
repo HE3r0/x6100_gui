@@ -49,12 +49,12 @@ typedef struct {
 void wifi_power_setup();
 
 /**
- * Turn WiFi/BT chip on
+ * Turn WiFi radio module on (shared RF module power).
  */
 void wifi_power_on();
 
 /**
- * Turn WiFi/BT chip off
+ * Turn WiFi radio module off.
  */
 void wifi_power_off();
 
