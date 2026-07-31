@@ -167,11 +167,12 @@ static bool adapter_call(const char *method, GError **error) {
 
     g_object_unref(conn);
 
-    if (result) {
-        g_variant_unref(result);
+    if (!result) {
+        return false;
     }
 
-    return !error || !*error;
+    g_variant_unref(result);
+    return true;
 }
 
 static bool prop_dict_get_string(GVariant *props, const char *key, char *buf, size_t buf_size) {
@@ -266,11 +267,14 @@ static void parse_managed_objects(GVariant *result) {
     device_count = 0;
     g_variant_get(result, "(a{oa{sa{sv}}})", &objects_iter);
 
+    /* Use g_variant_iter_next (not loop): we own the returned interfaces variant. */
     while (device_count < BT_MAX_DEVICES &&
-           g_variant_iter_loop(objects_iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
+           g_variant_iter_next(objects_iter, "{&o@a{sa{sv}}}", &path, &interfaces)) {
         GVariant *props = g_variant_lookup_value(interfaces, DEVICE_INTERFACE, G_VARIANT_TYPE("a{sv}"));
+        g_variant_unref(interfaces);
+        interfaces = NULL;
+
         if (!props) {
-            g_variant_unref(interfaces);
             continue;
         }
 
@@ -289,7 +293,6 @@ static void parse_managed_objects(GVariant *result) {
         prop_dict_get_int16(props, "RSSI", &dev->rssi);
 
         g_variant_unref(props);
-        g_variant_unref(interfaces);
         device_count++;
     }
 
@@ -511,7 +514,6 @@ void bluetooth_start_scan(void) {
 
     scanning = true;
     scan_started_at = time(NULL);
-    notify_devices_changed();
     bluetooth_refresh_devices();
 }
 

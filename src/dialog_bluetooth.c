@@ -15,12 +15,11 @@
 
 #include "lvgl/lvgl.h"
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <stdint.h>
 
 #define DIALOG_WIDTH 775
 #define DIALOG_HEIGHT 320
-#define PARAMS_WIDTH 300
+#define PARAMS_WIDTH 260
 
 static void construct_cb(lv_obj_t *parent);
 static void destruct_cb(void);
@@ -35,10 +34,10 @@ static void bt_state_changed_cb(void *s, lv_msg_t *m);
 static void bt_devices_changed_cb(void *s, lv_msg_t *m);
 static void update_status_label(void);
 static void update_devices_table(void);
-static void clear_devices_table(void);
 static void start_refresh_devices(void);
 static void stop_refresh_devices(void);
 static void update_devices_table_cb(lv_timer_t *timer);
+static void refresh_buttons(void);
 
 static button_data_t btn_on_off = {
     .type     = BTN_TEXT_FN,
@@ -56,12 +55,13 @@ static buttons_page_t btn_page = {
     {&btn_on_off, &btn_scan}
 };
 
-static lv_obj_t *label_status;
-static lv_obj_t *label_scan;
-static lv_obj_t *device_table;
+static lv_obj_t   *label_status;
+static lv_obj_t   *label_scan;
+static lv_obj_t   *device_table;
 static lv_timer_t *timer_refresh_devices = NULL;
 static void       *subscription_state = NULL;
 static void       *subscription_devices = NULL;
+static bool        updating_table = false;
 
 static dialog_t dialog = {
     .run          = false,
@@ -95,7 +95,6 @@ static void construct_cb(lv_obj_t *parent) {
     lv_obj_t *label = lv_label_create(param_cont);
     lv_label_set_text(label, "Status:");
     label_status = lv_label_create(param_cont);
-    lv_obj_set_style_text_line_space(label_status, 8, 0);
     update_status_label();
 
     label = lv_label_create(param_cont);
@@ -131,19 +130,17 @@ static void construct_cb(lv_obj_t *parent) {
     lv_group_add_obj(keyboard_group, device_table);
     lv_group_set_editing(keyboard_group, true);
 
-    clear_devices_table();
-    start_refresh_devices();
-
     subscription_state = lv_msg_subscribe(MSG_BT_STATE_CHANGED, bt_state_changed_cb, NULL);
     subscription_devices = lv_msg_subscribe(MSG_BT_DEVICES_CHANGED, bt_devices_changed_cb, NULL);
+
     update_status_label();
     update_devices_table();
+    start_refresh_devices();
 }
 
 static void destruct_cb(void) {
-    bluetooth_stop_scan();
     stop_refresh_devices();
-    clear_devices_table();
+    bluetooth_stop_scan();
 
     if (subscription_state) {
         lv_msg_unsubscribe(subscription_state);
@@ -153,6 +150,10 @@ static void destruct_cb(void) {
         lv_msg_unsubscribe(subscription_devices);
         subscription_devices = NULL;
     }
+
+    device_table = NULL;
+    label_status = NULL;
+    label_scan = NULL;
 }
 
 static void key_cb(lv_event_t *e) {
@@ -164,6 +165,10 @@ static void key_cb(lv_event_t *e) {
 }
 
 static void device_selected_cb(lv_event_t *e) {
+    if (updating_table) {
+        return;
+    }
+
     lv_obj_t *obj = lv_event_get_target(e);
     uint16_t  row;
     uint16_t  col;
@@ -174,15 +179,8 @@ static void device_selected_cb(lv_event_t *e) {
         return;
     }
 
-    const char *user_data = (const char *)lv_table_get_cell_user_data(obj, row, col);
-    if (!user_data || user_data[0] == '\0') {
-        bluetooth_set_selected_index(-1);
-        return;
-    }
-
-    char *end = NULL;
-    long  index = strtol(user_data, &end, 10);
-    if (end == user_data || (end && *end != '\0')) {
+    intptr_t index = (intptr_t)lv_table_get_cell_user_data(obj, row, col);
+    if (index < 0) {
         bluetooth_set_selected_index(-1);
         return;
     }
@@ -216,12 +214,15 @@ static void start_scan_cb(button_data_t *btn_data) {
     }
 
     if (bluetooth_scanning()) {
-        msg_update_text_fmt("Stop scan");
         bluetooth_stop_scan();
+        msg_update_text_fmt("Scan stopped");
     } else {
-        msg_update_text_fmt("Start scan");
         bluetooth_start_scan();
+        msg_update_text_fmt("Scanning...");
     }
+
+    update_status_label();
+    refresh_buttons();
 }
 
 static const char *bt_on_off_label_getter(void) {
@@ -243,20 +244,24 @@ static const char *bt_scan_label_getter(void) {
 }
 
 static void update_status_label(void) {
+    if (!label_status) {
+        return;
+    }
+
     const char *text;
 
     if (!params.wifi_enabled.x) {
-        text = "Radio module off.\nTurn WiFi on to use Bluetooth.";
+        text = "Radio off";
     } else {
         switch (bluetooth_get_status()) {
         case BT_STATUS_ON:
-            text = "Adapter powered on.";
+            text = "Powered On";
             break;
         case BT_STATUS_OFF:
-            text = "Adapter powered off.";
+            text = "Powered Off";
             break;
         default:
-            text = "Adapter unavailable.";
+            text = "Unavailable";
             break;
         }
     }
@@ -274,42 +279,31 @@ static void update_status_label(void) {
     }
 }
 
-static void clear_devices_table(void) {
-    if (!device_table) {
-        return;
-    }
-
-    uint16_t rows = lv_table_get_row_cnt(device_table);
-    for (uint16_t row = 0; row < rows; row++) {
-        void *user_data = lv_table_get_cell_user_data(device_table, row, 0);
-        if (user_data) {
-            free(user_data);
-            lv_table_set_cell_user_data(device_table, row, 0, NULL);
-        }
-    }
-
-    lv_table_set_cell_value(device_table, 0, 0, "");
-    lv_table_set_row_cnt(device_table, 1);
-    lv_event_send(device_table, LV_EVENT_VALUE_CHANGED, NULL);
-}
-
 static void update_devices_table(void) {
-    if (!device_table) {
+    if (!device_table || updating_table) {
         return;
     }
 
-    clear_devices_table();
+    updating_table = true;
 
     size_t count = bluetooth_device_count();
     if (count == 0) {
+        lv_table_set_row_cnt(device_table, 1);
         lv_table_set_cell_value(device_table, 0, 0, bluetooth_scanning() ? "Scanning..." : "No devices");
+        lv_table_set_cell_user_data(device_table, 0, 0, (void *)(intptr_t)-1);
+        updating_table = false;
         return;
     }
 
+    lv_table_set_row_cnt(device_table, count);
+
     for (size_t i = 0; i < count; i++) {
         const bt_device_info_t *dev = bluetooth_get_device(i);
-        char                    suffix[16] = "";
-        char                   *index_str = NULL;
+        char                    suffix[8] = "";
+
+        if (!dev) {
+            continue;
+        }
 
         if (dev->connected) {
             snprintf(suffix, sizeof(suffix), " [C]");
@@ -318,18 +312,19 @@ static void update_devices_table(void) {
         }
 
         if (dev->rssi != 0) {
-            lv_table_set_cell_value_fmt(device_table, i, 0, "%s  %d dBm%s", dev->name, dev->rssi, suffix);
+            lv_table_set_cell_value_fmt(device_table, i, 0, "%s  %d dBm%s",
+                                        dev->name[0] ? dev->name : "?",
+                                        (int)dev->rssi, suffix);
         } else {
-            lv_table_set_cell_value_fmt(device_table, i, 0, "%s%s", dev->name, suffix);
+            lv_table_set_cell_value_fmt(device_table, i, 0, "%s%s",
+                                        dev->name[0] ? dev->name : "?",
+                                        suffix);
         }
 
-        if (asprintf(&index_str, "%zu", i) >= 0) {
-            lv_table_set_cell_user_data(device_table, i, 0, index_str);
-        }
+        lv_table_set_cell_user_data(device_table, i, 0, (void *)(intptr_t)i);
     }
 
-    lv_table_set_row_cnt(device_table, count);
-    lv_event_send(device_table, LV_EVENT_VALUE_CHANGED, NULL);
+    updating_table = false;
 }
 
 static void refresh_buttons(void) {
@@ -350,15 +345,7 @@ static void bt_state_changed_cb(void *s, lv_msg_t *m) {
     (void)m;
 
     update_status_label();
-
-    if (!bluetooth_is_powered()) {
-        bluetooth_stop_scan();
-        update_devices_table();
-    } else if (device_table) {
-        bluetooth_refresh_devices();
-        update_devices_table();
-    }
-
+    update_devices_table();
     refresh_buttons();
 }
 
@@ -387,12 +374,9 @@ static void stop_refresh_devices(void) {
 static void update_devices_table_cb(lv_timer_t *timer) {
     (void)timer;
 
-    if (!bluetooth_is_powered()) {
+    if (!dialog.run || !bluetooth_is_powered()) {
         return;
     }
 
     bluetooth_refresh_devices();
-    update_status_label();
-    update_devices_table();
-    refresh_buttons();
 }
