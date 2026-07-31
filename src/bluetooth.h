@@ -53,6 +53,9 @@ void bluetooth_refresh_devices(void);
 
 size_t bluetooth_device_count(void);
 
+/* Thread-safe snapshot of discovered devices. Returns count copied. */
+size_t bluetooth_copy_devices(bt_device_info_t *out, size_t max);
+
 const bt_device_info_t *bluetooth_get_device(size_t index);
 
 const bt_device_info_t *bluetooth_get_selected_device(void);

@@ -212,24 +212,10 @@ static void start_scan_cb(button_data_t *btn_data) {
         return;
     }
 
-    /* Do not refresh buttons / send msgs here — that re-enters LVGL mid-press. */
     if (bluetooth_scanning()) {
         bluetooth_stop_scan();
-        if (label_scan) {
-            lv_label_set_text(label_scan, "Stopping...");
-        }
     } else {
         bluetooth_start_scan();
-        if (label_scan) {
-            lv_label_set_text(label_scan, "Starting...");
-        }
-        if (device_table) {
-            updating_table = true;
-            lv_table_set_row_cnt(device_table, 1);
-            lv_table_set_cell_value(device_table, 0, 0, "Scanning...");
-            lv_table_set_cell_user_data(device_table, 0, 0, (void *)(intptr_t)-1);
-            updating_table = false;
-        }
     }
 }
 
@@ -288,13 +274,16 @@ static void update_status_label(void) {
 }
 
 static void update_devices_table(void) {
+    bt_device_info_t snapshot[BT_MAX_DEVICES];
+    size_t           count;
+
     if (!device_table || updating_table) {
         return;
     }
 
     updating_table = true;
+    count = bluetooth_copy_devices(snapshot, BT_MAX_DEVICES);
 
-    size_t count = bluetooth_device_count();
     if (count == 0) {
         lv_table_set_row_cnt(device_table, 1);
         lv_table_set_cell_value(device_table, 0, 0,
@@ -311,15 +300,10 @@ static void update_devices_table(void) {
     lv_table_set_row_cnt(device_table, (uint16_t)count);
 
     for (size_t i = 0; i < count; i++) {
-        const bt_device_info_t *dev = bluetooth_get_device(i);
+        const bt_device_info_t *dev = &snapshot[i];
         char                    line[96];
-        const char             *name;
-
-        if (!dev) {
-            continue;
-        }
-
-        name = dev->name[0] ? dev->name : (dev->address[0] ? dev->address : "?");
+        const char             *name = dev->name[0] ? dev->name
+                                                    : (dev->address[0] ? dev->address : "?");
 
         if (dev->rssi != 0) {
             snprintf(line, sizeof(line), "%s  %d%s", name, (int)dev->rssi,
